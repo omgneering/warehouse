@@ -1,6 +1,7 @@
 defmodule Warehouse.Receiver do
   use GenServer
-  alias Warehouse.Deliverator
+  alias Warehouse.{Deliverator, DeliveratorPool}
+  @batch_size 20
 
   def start_link do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
@@ -9,15 +10,12 @@ defmodule Warehouse.Receiver do
   def init(_) do
     state = %{
       assignments: [],
+      batch_size: @batch_size,
+      packages_buffer: [],
+      delivered_packages: [],
     }
 
     {:ok, state}
-  end
-
-  def receive_and_chunk(packages) do
-    packages
-    |> Enum.chunk_every(5)
-    |> Enum.each(&receive_packages/1)
   end
 
   def receive_packages(packages) do
@@ -26,10 +24,24 @@ defmodule Warehouse.Receiver do
 
   def handle_cast({:receive_packages, packages}, state) do
     IO.puts "received #{Enum.count(packages)} packages"
-    {:ok, deliverator} = Deliverator.start
-    Process.monitor(deliverator)
-    state = assign_packages(state, packages, deliverator)
-    Deliverator.deliver_packages(deliverator, packages)
+
+    state = case DeliveratorPool.available_deliverator do
+      {:ok, deliverator} ->
+        IO.puts "deliverator #{inspect deliverator} acquired, assigning batch"
+        {package_batch, remaining_packages} = Enum.split(packages, @batch_size)
+        Process.monitor(deliverator)
+        state = assign_packages(state, package_batch, deliverator)
+        DeliveratorPool.flag_deliverator_busy(deliverator)
+        Deliverator.deliver_packages(deliverator, package_batch)
+        if Enum.count(remaining_packages) > 0 do
+          receive_packages(remaining_packages)
+        end
+        state
+      {:error, message} ->
+        IO.puts "#{message}"
+        IO.puts "buffering #{Enum.count(packages)} packages"
+    end
+
     {:noreply, state}
   end
 
@@ -40,13 +52,20 @@ defmodule Warehouse.Receiver do
       |> Enum.filter(fn({assigned_package, _pid}) -> assigned_package == package end)
 
     assignments = state.assignments -- delivered_assignments
-    state = %{state | assignments: assignments}
+    delivered_packages = [package | state.delivered_packages]
+    state = %{state | assignments: assignments, delivered_packages: delivered_packages}
 
     {:noreply, state}
   end
 
-  def handle_info({:DOWN, _ref, :process, deliverator, :normal}, state) do
-    IO.puts "deliverator #{inspect deliverator} completed the mission and terminated"
+  def handle_info({:deliverator_idle, deliverator}, state) do
+    IO.puts "deliverator #{inspect deliverator} completed the mission"
+    DeliveratorPool.flag_deliverator_idle(deliverator)
+    {next_batch, remaining_packages} = Enum.split(state.packages_buffer, @batch_size)
+    if Enum.count(next_batch) > 0 do
+      receive_packages(next_batch)
+    end
+    state = %{state | packages_buffer: remaining_packages}
     {:noreply, state}
   end
 
@@ -54,7 +73,7 @@ defmodule Warehouse.Receiver do
     IO.puts "deliverator #{inspect deliverator} went down. details: #{inspect reason}"
     failed_assignments = filter_by_deliverator(deliverator, state.assignments)
     failed_packages = failed_assignments |> Enum.map(fn({package, _pid}) -> package end)
-
+    DeliveratorPool.remove_deliverator(deliverator)
     assignments = state.assignments -- failed_assignments
     state = %{state | assignments: assignments}
     receive_packages(failed_packages)
